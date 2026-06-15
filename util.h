@@ -11,22 +11,17 @@ static inline uint64_t _vqueue_mix64(uint64_t x){
 	return x;
 }
 
-// "Protect" a pointer
-static inline uint8_t _vqueue_protect(struct _vqueue* q, uint64_t ptr){
-	union{
-		uint64_t u64;
-		uint8_t u8[8];
-	} hash = {.u64 = _vqueue_mix64(ptr)};
-	ptr |= q->aid<<40;
+static inline uint8_t _vqueue_protect_h(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint64_t h){
+	ptr = ~(ptr|q->aid<<40);
 	for(unsigned i = 0; ; i++){
-		uint8_t n = hash.u8[i&7];
+		uint8_t n = h>>((i&7)*8)&255;
 		uint64_t current = 0;
 		retry:
-		if(atomic_compare_exchange_strong_explicit(&q->header->hazfield[n], &current, ptr, memory_order_acquire, memory_order_relaxed)){
+		if(atomic_compare_exchange_strong_explicit(&mapping->hazfield[n], &current, ptr, memory_order_acquire, memory_order_relaxed)){
 			return n;
 		}
 		if(i >= 63){
-			struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = current&0xFFFFFF, .l_len = 1 };
+			struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = (~current)>>40, .l_len = 1 };
 			if(!fcntl(q->shmem_fd, F_GETLK, &l) && l.l_type == F_UNLCK){
 				// previous slot owner died, it's okay to replace the current value
 				i &= 7;
@@ -37,61 +32,51 @@ static inline uint8_t _vqueue_protect(struct _vqueue* q, uint64_t ptr){
 			thread_yield();
 		}
 	}
+	thread_memory_barrier(mb_co_acquire);
 }
 
-static inline bool _vqueue_reprotect(struct _vqueue* q, uint8_t n, uint64_t ptr){
-	uint64_t put = ptr<<24|q->aid;
-	put = atomic_exchange_explicit(&q->header->hazfield[n], put, memory_order_acquire, memory_order_relaxed);
-	return (put | 0xFFFFFF0000000000) == (uint64_t)-1ull;
+// "Protect" a pointer
+static inline uint8_t _vqueue_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
+	_vqueue_protect_h(q, mapping, ptr, _vqueue_mix64(ptr));
 }
 
-static inline bool _vqueue_unprotect(struct _vqueue* q, uint8_t n){
-	return (atomic_exchange_explicit(&q->header->hazfield[n], 0, memory_order_release) | 0xFFFFFF0000000000) == (uint64_t)-1ull;
+static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left);
+
+static inline void _vqueue_unprotect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint8_t n, uint64_t z){
+	atomic_store_explicit(&mapping->hazfield[n], z, memory_order_release);
+	if(atomic_load_explicit((_Atomic uint64_t*) &mapping->left, memory_order_acquire) == ptr){
+		_vqueue_trim(q, mapping, ptr);
+	}
 }
 
-static inline uint32_t _vqueue_kill(struct _vqueue* q, uint64_t ptr){
-	atomic_thread_fence(memory_order_release);
-	union{
-		uint64_t u64;
-		uint8_t u8[8];
-	} hash = {.u64 = _vqueue_mix64(ptr)};
+static inline uint32_t _vqueue_check_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
+	uint64_t h = _vqueue_mix64(ptr);
 	for(unsigned i = 0; i < 8; i++){
-		_Atomic uint64_t* slot = &q->header->hazfield[hash.u8[i&7]];
+		_Atomic uint64_t* slot = &mapping->hazfield[h>>((i&7)*8)&255];
 		uint64_t val = atomic_load_explicit(slot, memory_order_relaxed);
-		if((val >> 24) == ptr){
-			uint64_t val2 = val & 0xFFFFFF0000000000 | 0xFFFFFFFFFF;
-			if(atomic_compare_exchange_strong_explicit(slot, &val, val2, memory_order_relaxed, memory_order_relaxed)){
-				// Ownership transferred
-				return val>>40;
-			}
+		if(((~val) & 0xFFFFFFFFFF) == ptr){
+			// Ownership transferred
+			return -1u;
 		}
 	}
-	return -1u;
+	return _vqueue_protect_h(q, mapping, ptr, h);
 }
 
-static inline void _vqueue_try_free(struct _vqueue* q, uint64_t ptr);
-
-static inline uint64_t _vqueue_pointer_acquire2(struct _vqueue* q, _Atomic uint64_t* ptr, uint64_t v, uint8_t* lock_out){
+static inline uint64_t _vqueue_pointer_acquire2(struct _vqueue* q, struct _vqueue_shmem_region* mapping, _Atomic uint64_t* ptr, uint64_t v, uint8_t* lock_out){
 	if(!(v&0xFFFFFFFFFF)) return v;
-	uint8_t n = _vqueue_protect(q, v);
+	uint8_t n = _vqueue_protect(q, mapping, v);
 	retry: {}
-	uint64_t v2 = v; v = atomic_load_explicit(ptr, memory_order_acquire);
+	uint64_t v2 = v; v = atomic_load_explicit(ptr, memory_order_relaxed);
 	if(v != v2){
-		if(_vqueue_reprotect(q, n, v)){
-			_vqueue_try_free(q, v2);
-		}
+		_vqueue_unprotect(q, mapping, v2, n, ~(v<<24|q->aid));
 		goto retry;
 	}
 	*lock_out = n;
 	return v;
 }
 
-static inline uint64_t _vqueue_pointer_acquire(struct _vqueue* q, _Atomic uint64_t* ptr, uint8_t* lock_out){
-	_vqueue_pointer_acquire2(q, ptr, lock_out, atomic_load_explicit(ptr, memory_order_acquire));
-}
-
-static inline uint64_t _vqueue_pointer_release(struct _vqueue* q, uint64_t ptr, uint8_t lock){
-	if((ptr&0xFFFFFFFFFF) && _vqueue_unprotect(q, lock)) _vqueue_try_free(q, ptr);
+static inline uint64_t _vqueue_pointer_acquire(struct _vqueue* q, struct _vqueue_shmem_region* mapping, _Atomic uint64_t* ptr, uint8_t* lock_out){
+	_vqueue_pointer_acquire2(q, mapping, ptr, lock_out, atomic_load_explicit(ptr, memory_order_acquire));
 }
 
 static inline uint64_t _vqueue_compress_size(size_t sz){

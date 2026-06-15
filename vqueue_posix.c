@@ -23,7 +23,7 @@ struct _vqueue_msg_hdr{
 struct _vqueue_shmem_region{
 	sem_t sema4;
 	_Atomic uint32_t open_counter;
-	_Atomic uint64_t head, tailp;
+	_Atomic uint64_t head, tailp, left, right, end;
 	// 8-way hash table of hazard pointers
 	_Atomic uint64_t hazfield[256];
 	char unused_[_VQUEUE_MSG_HDR_SIZE];
@@ -216,7 +216,17 @@ bool vqueue_unlink(const char* name, size_t name_sz){
 }
 
 vqueue_block_t vqueue_alloc(vqueue_t* q, size_t bytes){
+	uint64_t mapping_size;
+	struct _vqueue_shmem_region* mapping = _vqueue_get_mapping(q, &mapping_size);
+	uint8_t n;
+	uint64_t left = _vqueue_pointer_acquire(q, mapping, &mapping->left, &n);
+	uint64_t right = atomic_load_explicit(&mapping->right, memory_order_relaxed);
+	retry: {}
+	uint64_t right2 = right+bytes+_VQUEUE_MSG_HDR_SIZE;
+	if(right2 <= left){
+		if(!atomic_compare_exchange_weak_explicit(&mapping->right, &right, right2, memory_order_acquire, memory_order_relaxed)) goto retry;
 
+	}
 }
 void vqueue_post(vqueue_t* q, vqueue_block_t block){
 	uint64_t mapping_size;
@@ -224,7 +234,7 @@ void vqueue_post(vqueue_t* q, vqueue_block_t block){
 	uint64_t new_ptr = ((char(*)[64])block.data - mapping->blocks) | _vqueue_compress_size(block.size)<<40;
 
 	uint8_t n;
-	uint64_t ptr = _vqueue_pointer_acquire(q, &mapping->tailp, &n), vo;
+	uint64_t ptr = _vqueue_pointer_acquire(q, mapping, &mapping->tailp, &n), vo;
 	_Atomic uint64_t* hdr2n;
 	// Pointer chase
 	while(true){
@@ -232,8 +242,8 @@ void vqueue_post(vqueue_t* q, vqueue_block_t block){
 		vo = atomic_load_explicit(hdr2n, memory_order_acquire);
 		cmpxchg_failed: {
 			uint8_t n2;
-			vo = _vqueue_pointer_acquire2(q, hdr2n, n2, vo);
-			_vqueue_pointer_release(q, ptr, n);
+			vo = _vqueue_pointer_acquire2(q, mapping, hdr2n, n2, vo);
+			_vqueue_unprotect(q, mapping, ptr, n, 0);
 			ptr = vo&0xFFFFFFFFFF; n = n2;
 		}
 	}
@@ -241,8 +251,8 @@ void vqueue_post(vqueue_t* q, vqueue_block_t block){
 	if(!atomic_compare_exchange_strong_explicit(hdr2n, &vo, new_ptr, memory_order_acquire, memory_order_acquire)){
 		goto cmpxchg_failed;
 	}
-	_vqueue_pointer_release(q, ptr, n);
-	
+	_vqueue_unprotect(q, mapping, ptr, n, 0);
+
 	_vqueue_release_mapping(q, mapping, mapping_size);
 	if(!ptr) sem_post(&mapping->sema4);
 }
@@ -252,9 +262,9 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 	struct _vqueue_shmem_region* mapping = _vqueue_acquire_mapping(q, &mapping_size);
 	retry: {}
 	uint8_t n;
-	uint64_t ptr = _vqueue_pointer_acquire(q, &mapping->head, &n);
+	uint64_t ptr = _vqueue_pointer_acquire(q, mapping, &mapping->head, &n);
 	find_next:
-	if(!(ptr&0xFFFFFFFFFF)){
+	if((ptr&0xFFFFFFFFFF) == 0xFFFFFFFFFF){
 		// No messages. Block
 		sem_wait(&mapping->sema4);
 		goto retry;
@@ -269,18 +279,43 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 	if(v >> 24){
 		// Someone else acquired it, we find next message
 		uint8_t n2;
-		uint64_t ptr2 = _vqueue_pointer_acquire(q, &hdr->next, &n);
-		_vqueue_pointer_release(q, ptr, n);
+		uint64_t ptr2 = _vqueue_pointer_acquire(q, mapping, &hdr->next, &n);
+		_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n, 0);
 		ptr = ptr2; n = n2;
 		goto find_next;
 	}
 	if(!atomic_compare_exchange_weak_explicit(&hdr->aid, &v, q->aid|0x1000000, memory_order_acquire, memory_order_relaxed)) goto retry;
-	_vqueue_pointer_release(q, ptr, n);
+	_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n, 0);
 	return (vqueue_block_t){hdr->size, payload};
 }
+
+static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left){
+	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) &mapping->blocks[left]) - 1;
+	again:
+	uint32_t current = -1u, n = _vqueue_check_protect(q, mapping, left);
+	if(n == -1u) return;
+	if(atomic_load_explicit(&mapping->left, memory_order_acquire) == left){
+		if(atomic_load_explicit(&hdr->aid, memory_order_relaxed) == -1u){
+			uint64_t next = left + hdr->size + _VQUEUE_MSG_HDR_SIZE;
+			next += (-next)&63;
+			atomic_store_explicit(&mapping->left, next, memory_order_relaxed);
+			left = next; goto again;
+		}
+		_vqueue_unprotect(q, mapping, left, n, 0);
+	}else{
+		_vqueue_unprotect(q, mapping, left, n, 0);
+		thread_memory_barrier(mb_co_release);
+		if(atomic_load_explicit(&mapping->left, memory_order_relaxed) == left) goto again;
+	}
+}
+
 void vqueue_free(vqueue_t* q, vqueue_block_t block){
 	uint64_t mapping_size;
 	struct _vqueue_shmem_region* mapping = _vqueue_get_mapping_for(q, &mapping_size, block.data);
-
+	uint64_t ptr = (char(*)[64])block.data - mapping->blocks;
+	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) block.data) - 1;
+	atomic_store_explicit(&hdr->aid, -1, memory_order_relaxed);
+	if(atomic_load_explicit(&mapping->left, memory_order_relaxed) == ptr)
+		_vqueue_trim(q, mapping, ptr);
 	_vqueue_release_mapping(q, mapping, mapping_size);
 }

@@ -3,10 +3,8 @@
 #include "a.h"
 
 static inline uint64_t _vqueue_mix64(uint64_t x){
-	x ^= x >> 30;
 	x *= 0xbf58476d1ce4e5b9ULL;
 	x ^= x >> 27;
-	x *= 0x94d049bb133111ebULL;
 	x ^= x >> 31;
 	return x;
 }
@@ -40,12 +38,15 @@ static inline uint8_t _vqueue_protect(struct _vqueue* q, struct _vqueue_shmem_re
 	_vqueue_protect_h(q, mapping, ptr, _vqueue_mix64(ptr));
 }
 
-static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left);
+static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left, bool strict);
 
-static inline void _vqueue_unprotect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint8_t n, uint64_t z){
+static inline bool _vqueue_unprotect2(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint8_t n, uint64_t z){
 	atomic_store_explicit(&mapping->hazfield[n], z, memory_order_release);
-	if(atomic_load_explicit((_Atomic uint64_t*) &mapping->left, memory_order_acquire) == ptr){
-		_vqueue_trim(q, mapping, ptr);
+	return atomic_load_explicit((_Atomic uint64_t*) &mapping->left, memory_order_acquire) == ptr;
+}
+static inline void _vqueue_unprotect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint8_t n){
+	if(_vqueue_unprotect2(q, mapping, ptr, n, 0)){
+		_vqueue_trim(q, mapping, ptr, false);
 	}
 }
 
@@ -68,7 +69,8 @@ static inline uint64_t _vqueue_pointer_acquire2(struct _vqueue* q, struct _vqueu
 	retry: {}
 	uint64_t v2 = v; v = atomic_load_explicit(ptr, memory_order_relaxed);
 	if(v != v2){
-		_vqueue_unprotect(q, mapping, v2, n, ~(v<<24|q->aid));
+		if(_vqueue_unprotect2(q, mapping, v2, n, ~(v<<24|q->aid)))
+			_vqueue_trim(q, mapping, v2, false);
 		goto retry;
 	}
 	*lock_out = n;

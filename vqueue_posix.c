@@ -269,7 +269,7 @@ vqueue_block_t vqueue_alloc(vqueue_t* q, size_t size){
 		if(atomic_compare_exchange_strong_explicit(&mapping->rightinit, &right, right2, memory_order_release, memory_order_relaxed)){
 			atomic_compare_exchange_strong_explicit(&mapping->right, &right2_tagged, right2, memory_order_release, memory_order_relaxed);
 		}
-		_vqueue_unprotect(q, mapping, left, n, 0);
+		_vqueue_unprotect(q, mapping, left, n);
 		return (vqueue_block_t){size, (uint8_t*)&mapping->blocks[right]};
 	}
 	// Append to end
@@ -293,7 +293,7 @@ vqueue_block_t vqueue_alloc(vqueue_t* q, size_t size){
 	if(atomic_compare_exchange_strong_explicit(&mapping->endinit, &end, end2, memory_order_release, memory_order_relaxed)){
 		atomic_compare_exchange_strong_explicit(&mapping->end, &end2_tagged, end2, memory_order_release, memory_order_relaxed);
 	}
-	_vqueue_unprotect(q, mapping, left, n, 0);
+	_vqueue_unprotect(q, mapping, left, n);
 	return (vqueue_block_t){size, (uint8_t*)&mapping->blocks[end]};
 }
 void vqueue_post(vqueue_t* q, vqueue_block_t block){
@@ -311,7 +311,7 @@ void vqueue_post(vqueue_t* q, vqueue_block_t block){
 		cmpxchg_failed: {
 			uint8_t n2;
 			vo = _vqueue_pointer_acquire2(q, mapping, hdr2n, n2, vo);
-			_vqueue_unprotect(q, mapping, ptr, n, 0);
+			_vqueue_unprotect(q, mapping, ptr, n);
 			ptr = vo&0xFFFFFFFFFF; n = n2;
 		}
 	}
@@ -319,7 +319,7 @@ void vqueue_post(vqueue_t* q, vqueue_block_t block){
 	if(!atomic_compare_exchange_strong_explicit(hdr2n, &vo, new_ptr, memory_order_acquire, memory_order_acquire)){
 		goto cmpxchg_failed;
 	}
-	_vqueue_unprotect(q, mapping, ptr, n, 0);
+	_vqueue_unprotect(q, mapping, ptr, n);
 
 	_vqueue_release_mapping(q, mapping, mapping_size);
 	if(!ptr) sem_post(&mapping->sema4);
@@ -348,34 +348,42 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 		// Someone else acquired it, we find next message
 		uint8_t n2;
 		uint64_t ptr2 = _vqueue_pointer_acquire(q, mapping, &hdr->next, &n);
-		_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n, 0);
+		_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n);
 		ptr = ptr2; n = n2;
 		goto find_next;
 	}
 	// TODO: find absolute next to avoid UAF for other readers once we unprotect ptr
 	if(!atomic_compare_exchange_weak_explicit(&hdr->aid, &v, q->aid|0x1000000, memory_order_acquire, memory_order_relaxed)) goto retry;
 	atomic_store_explicit(&mapping->head, atomic_load_explicit(&hdr->next, memory_order_relaxed), memory_order_relaxed);
-	_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n, 0);
+	_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n);
 	return (vqueue_block_t){atomic_load_explicit(&hdr->size, memory_order_relaxed), payload};
 }
 
-static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left){
+static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left, bool strict){
+	uint32_t last_dead = -1;
+	if(strict){
+		// TODO: check hazfield
+	}
 	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) &mapping->blocks[left]) - 1;
 	again:
 	uint32_t current = -1u, n = _vqueue_check_protect(q, mapping, left);
 	if(n == -1u) return;
 	if(atomic_load_explicit(&mapping->left, memory_order_acquire) == left){
+		uint64_t oleft = left;
 		if(atomic_load_explicit(&hdr->aid, memory_order_relaxed) == -1u){
+			// TODO: bound by end
+			// TODO: wrap
+			// TODO: extra check if strict
 			uint64_t next = left + atomic_load_explicit(&hdr->size, memory_order_relaxed) + _VQUEUE_MSG_HDR_SIZE;
 			next += (-next)&63;
 			atomic_store_explicit(&mapping->left, next, memory_order_relaxed);
 			left = next; goto again;
 		}
-		_vqueue_unprotect(q, mapping, left, n, 0);
+		_vqueue_unprotect2(q, mapping, oleft, n, 0);
 	}else{
-		_vqueue_unprotect(q, mapping, left, n, 0);
+		bool again = _vqueue_unprotect2(q, mapping, left, n, 0);
 		thread_memory_barrier(mb_co_release);
-		if(atomic_load_explicit(&mapping->left, memory_order_relaxed) == left) goto again;
+		if(again) goto again;
 	}
 }
 
@@ -386,6 +394,6 @@ void vqueue_free(vqueue_t* q, vqueue_block_t block){
 	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) block.data) - 1;
 	atomic_store_explicit(&hdr->aid, -1, memory_order_relaxed);
 	if(atomic_load_explicit(&mapping->left, memory_order_relaxed) == ptr)
-		_vqueue_trim(q, mapping, ptr);
+		_vqueue_trim(q, mapping, ptr, false);
 	_vqueue_release_mapping(q, mapping, mapping_size);
 }

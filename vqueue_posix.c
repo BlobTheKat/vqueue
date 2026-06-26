@@ -343,18 +343,22 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 	uint8_t* payload = (uint8_t*)mapping->blocks[ptr&0xFFFFFFFFFF];
 	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) &payload) - 1;
 	uint32_t v = atomic_load_explicit(&hdr->aid, memory_order_relaxed);
+	uint64_t ptr2 = atomic_load_explicit(&hdr->next, memory_order_relaxed);
 	retry:
 	if(v >> 24){
 		// Someone else acquired it, we find next message
-		uint8_t n2;
-		uint64_t ptr2 = _vqueue_pointer_acquire(q, mapping, &hdr->next, &n);
 		_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n);
-		ptr = ptr2; n = n2;
+		n = _vqueue_protect(q, mapping, ptr2);
+		if(atomic_compare_exchange_strong_explicit(&mapping->head, &ptr, ptr2, memory_order_relaxed, memory_order_relaxed)){
+			ptr = ptr2;
+		}else{
+			_vqueue_unprotect(q, mapping, ptr2, n);
+			ptr = _vqueue_pointer_acquire2(q, mapping, &mapping->head, ptr, &n);
+		}
 		goto find_next;
 	}
-	// TODO: find absolute next to avoid UAF for other readers once we unprotect ptr
-	if(!atomic_compare_exchange_weak_explicit(&hdr->aid, &v, q->aid|0x1000000, memory_order_acquire, memory_order_relaxed)) goto retry;
-	atomic_store_explicit(&mapping->head, atomic_load_explicit(&hdr->next, memory_order_relaxed), memory_order_relaxed);
+	if(!atomic_compare_exchange_weak_explicit(&hdr->aid, &v, q->aid|0x1000000, memory_order_relaxed, memory_order_relaxed)) goto retry;
+	atomic_compare_exchange_strong_explicit(&mapping->head, &ptr, ptr2, memory_order_release, memory_order_relaxed);
 	_vqueue_unprotect(q, mapping, ptr&0xFFFFFFFFFF, n);
 	return (vqueue_block_t){atomic_load_explicit(&hdr->size, memory_order_relaxed), payload};
 }
@@ -362,7 +366,15 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left, bool strict){
 	uint32_t last_dead = -1;
 	if(strict){
-		// TODO: check hazfield
+		struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_len = 1 };
+		for(unsigned i = 0; i < 256; i++){
+			uint64_t v = atomic_load_explicit(&mapping->hazfield[i], memory_order_relaxed);
+			if(!v) continue;
+			l.l_start = (uint32_t)(~v>>40);
+			if(!fcntl(q->shmem_fd, F_GETLK, &l) && l.l_type == F_UNLCK){
+				atomic_compare_exchange_strong_explicit(&mapping->hazfield[i], &v, 0, memory_order_relaxed, memory_order_relaxed);
+			}
+		}
 	}
 	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) &mapping->blocks[left]) - 1;
 	again:

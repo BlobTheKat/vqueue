@@ -51,6 +51,7 @@ static inline void _vqueue_unprotect(struct _vqueue* q, struct _vqueue_shmem_reg
 }
 
 static inline uint32_t _vqueue_check_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
+	thread_memory_barrier(mb_co_release);
 	uint64_t h = _vqueue_mix64(ptr);
 	for(unsigned i = 0; i < 8; i++){
 		_Atomic uint64_t* slot = &mapping->hazfield[h>>((i&7)*8)&255];
@@ -60,6 +61,7 @@ static inline uint32_t _vqueue_check_protect(struct _vqueue* q, struct _vqueue_s
 			return -1u;
 		}
 	}
+	thread_memory_barrier(mb_acquire);
 	return _vqueue_protect_h(q, mapping, ptr, h);
 }
 

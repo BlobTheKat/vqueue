@@ -1,6 +1,48 @@
-#include <stdint.h>
-#include <stdatomic.h>
 #include "a.h"
+#include <fcntl.h>
+#include <semaphore.h>
+
+#define _VQUEUE_INIT_MAPPING 16384
+
+struct _vqueue_msg_hdr{
+	// High bits used to indicate whether it has been consumed yet
+	_Atomic uint32_t aid;
+	_Atomic size_t size;
+	_Atomic uint64_t next;
+	uint8_t payload[];
+};
+#define _VQUEUE_MSG_HDR_SIZE sizeof(struct _vqueue_msg_hdr)-4
+
+#define _VQUEUE_NUM_ALLOC_SEC 3
+struct _vqueue_alloc_section{ _Atomic uint64_t left, right, init; };
+struct _vqueue_shmem_region{
+	sem_t sema4;
+	_Atomic uint32_t open_counter;
+#if _VQUEUE_NUM_ALLOC_SEC <= 8
+	_Atomic uint32_t alloc_order;
+#else
+	_Atomic uint64_t alloc_order;
+#endif
+	_Atomic uint32_t trim_locks[_VQUEUE_NUM_ALLOC_SEC];
+	_Atomic uint64_t head, tailp;
+	struct _vqueue_alloc_section sec[_VQUEUE_NUM_ALLOC_SEC];
+	// 8-way hash table of hazard pointers
+	_Atomic uint64_t hazfield[256];
+	char unused_[_VQUEUE_MSG_HDR_SIZE];
+	_Alignas(64) char blocks[][64];
+};
+
+struct _vqueue_mapping_descriptor{
+	_Atomic uint64_t ref;
+	uint64_t ptr:40, size_packed:24;
+	struct _vqueue_mapping_descriptor *next;
+};
+
+struct _vqueue{
+	int shmem_fd; uint32_t aid;
+	lock_t mapping_lock;
+	struct _vqueue_mapping_descriptor mapping;
+};
 
 static inline uint64_t _vqueue_mix64(uint64_t x){
 	x *= 0xbf58476d1ce4e5b9ULL;
@@ -9,7 +51,9 @@ static inline uint64_t _vqueue_mix64(uint64_t x){
 	return x;
 }
 
-static inline uint8_t _vqueue_protect_h(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint64_t h){
+// "Protect" a pointer
+static inline uint8_t _vqueue_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
+	uint64_t h = _vqueue_mix64(ptr);
 	ptr = ~(ptr|q->aid<<40);
 	for(unsigned i = 0; ; i++){
 		uint8_t n = h>>((i&7)*8)&255;
@@ -26,31 +70,29 @@ static inline uint8_t _vqueue_protect_h(struct _vqueue* q, struct _vqueue_shmem_
 				goto retry;
 			}
 		}
-		if(i >= 15){
-			thread_yield();
-		}
+		if(i >= 15) thread_yield();
 	}
 	thread_memory_barrier(mb_co_acquire);
 }
 
-// "Protect" a pointer
-static inline uint8_t _vqueue_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
-	_vqueue_protect_h(q, mapping, ptr, _vqueue_mix64(ptr));
-}
+static inline void _vqueue_trim(struct _vqueue*, struct _vqueue_shmem_region*, size_t, uint64_t, bool);
 
-static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left, bool strict);
-
-static inline bool _vqueue_unprotect2(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint8_t n, uint64_t z){
+static inline void _vqueue_unprotect3(struct _vqueue_shmem_region* mapping, uint8_t n, uint64_t z){
 	atomic_store_explicit(&mapping->hazfield[n], z, memory_order_release);
-	return atomic_load_explicit((_Atomic uint64_t*) &mapping->left, memory_order_acquire) == ptr;
+}
+static inline size_t _vqueue_unprotect2(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint8_t n, uint64_t z){
+	_vqueue_unprotect3(mapping, n, z);
+	for(unsigned i = 0; i < _VQUEUE_NUM_ALLOC_SEC; i++)
+		if(atomic_load_explicit(&mapping->sec[i].left, memory_order_acquire) == ptr) return i;
+	
+	return _VQUEUE_NUM_ALLOC_SEC;
 }
 static inline void _vqueue_unprotect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr, uint8_t n){
-	if(_vqueue_unprotect2(q, mapping, ptr, n, 0)){
-		_vqueue_trim(q, mapping, ptr, false);
-	}
+	struct _vqueue_alloc_section* p = _vqueue_unprotect2(q, mapping, ptr, n, 0);
+	if(p) _vqueue_trim(q, mapping, p, ptr, false);
 }
 
-static inline uint32_t _vqueue_check_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
+static inline bool _vqueue_check_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
 	thread_memory_barrier(mb_co_release);
 	uint64_t h = _vqueue_mix64(ptr);
 	for(unsigned i = 0; i < 8; i++){
@@ -58,11 +100,11 @@ static inline uint32_t _vqueue_check_protect(struct _vqueue* q, struct _vqueue_s
 		uint64_t val = atomic_load_explicit(slot, memory_order_relaxed);
 		if(((~val) & 0xFFFFFFFFFF) == ptr){
 			// Ownership transferred
-			return -1u;
+			return false;
 		}
 	}
 	thread_memory_barrier(mb_acquire);
-	return _vqueue_protect_h(q, mapping, ptr, h);
+	return true;
 }
 
 static inline uint64_t _vqueue_pointer_acquire2(struct _vqueue* q, struct _vqueue_shmem_region* mapping, _Atomic uint64_t* ptr, uint64_t v, uint8_t* lock_out){
@@ -71,8 +113,8 @@ static inline uint64_t _vqueue_pointer_acquire2(struct _vqueue* q, struct _vqueu
 	retry: {}
 	uint64_t v2 = v; v = atomic_load_explicit(ptr, memory_order_relaxed);
 	if(v != v2){
-		if(_vqueue_unprotect2(q, mapping, v2, n, ~(v<<24|q->aid)))
-			_vqueue_trim(q, mapping, v2, false);
+		struct _vqueue_alloc_section* p = _vqueue_unprotect2(q, mapping, v2, n, ~(v<<24|q->aid));
+		if(p) _vqueue_trim(q, mapping, p, v2, false);
 		goto retry;
 	}
 	*lock_out = n;

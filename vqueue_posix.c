@@ -183,32 +183,33 @@ bool vqueue_unlink(const char* name, size_t name_sz){
 
 static inline uint8_t* _vqueue_try_alloc(struct _vqueue* q, _Atomic uint64_t* rp, _Atomic uint64_t* rip, struct _vqueue_shmem_region** mapping_, uint64_t* mapping_size, uint64_t size, uint64_t limit){
 	struct _vqueue_shmem_region* mapping = *mapping_;
-	uint64_t right = atomic_load_explicit(rp, memory_order_relaxed);
-	retry:
-	if(right >> 40){
-		uint64_t rinit = atomic_load_explicit(rip, memory_order_acquire);
-		if(rinit == (right & 0xFFFFFFFFFF)){
-			if(!atomic_compare_exchange_weak_explicit(rp, &right, right & 0xFFFFFFFFFF, memory_order_relaxed, memory_order_relaxed))
-				goto retry;
-		}else{
-			uint64_t expected_mapping_size = (char*)&mapping->blocks[rinit] - (char*)mapping;
-			if(expected_mapping_size > mapping_size)
-				mapping = _vqueue_resize_mapping(q, mapping, &mapping_size, expected_mapping_size);
-			struct _vqueue_msg_hdr* hdr = (struct _vqueue_msg_hdr*)&mapping->blocks[rinit] - 1;
-			atomic_store_explicit(&hdr->aid, right>>40, memory_order_relaxed);
-			// safe init that writes what gc pass would need but yields to the more precise value written by the actual allocating thread
-			size_t sz2 = right - rinit - _VQUEUE_MSG_HDR_SIZE - 63, sz = atomic_load_explicit(&hdr->size, memory_order_relaxed);
-			while(((sz - sz2)>>6) && !atomic_compare_exchange_weak_explicit(&hdr->size, &sz, sz2, memory_order_relaxed, memory_order_relaxed));
-
-			if(atomic_compare_exchange_strong_explicit(rip, &rinit, right & 0xFFFFFFFFFF, memory_order_release, memory_order_relaxed)
-		 	 && !atomic_compare_exchange_strong_explicit(rp, &right, right & 0xFFFFFFFFFF, memory_order_release, memory_order_relaxed))
-				goto retry;
-		}
+	if(!limit){ // unlikely clean-up edge case
+		atomic_store_explicit(rp, 0, memory_order_release);
+		atomic_store_explicit(rip, 0, memory_order_release);
+		if(!_vqueue_trim(q, mapping, 0, false))
+			return 0;
 	}
-	uint64_t rightb = right + ((size+_VQUEUE_MSG_HDR_SIZE + 63) >> 6);
+	uint64_t right = atomic_load_explicit(rp, memory_order_acquire), rightm = right&0xFFFFFFFFFF;
+	retry:
+	uint64_t rinit = atomic_load_explicit(rip, memory_order_acquire);
+	if(rightm > rinit){
+		uint64_t expected_mapping_size = (char*)&mapping->blocks[rinit] - (char*)mapping;
+		if(expected_mapping_size > mapping_size)
+			mapping = _vqueue_resize_mapping(q, mapping, &mapping_size, expected_mapping_size);
+		struct _vqueue_msg_hdr* hdr = (struct _vqueue_msg_hdr*)&mapping->blocks[rinit] - 1;
+		atomic_store_explicit(&hdr->aid, right == limit ? -1u : right>>40, memory_order_relaxed);
+		// safe init that writes what gc pass would need but yields to the more precise value written by the actual allocating thread
+		size_t sz2 = right - rinit - _VQUEUE_MSG_HDR_SIZE - 63, sz = atomic_load_explicit(&hdr->size, memory_order_relaxed);
+		while(((sz - sz2)>>6) && !atomic_compare_exchange_weak_explicit(&hdr->size, &sz, sz2, memory_order_relaxed, memory_order_relaxed));
+
+		if(atomic_compare_exchange_strong_explicit(rip, &rinit, rightm, memory_order_release, memory_order_relaxed)
+			&& !atomic_compare_exchange_strong_explicit(rp, &right, rightm, memory_order_release, memory_order_relaxed))
+			goto retry;
+	}
+	uint64_t rightb = rightm + ((size+_VQUEUE_MSG_HDR_SIZE + 63) >> 6);
 	if(rightb <= limit){
 		uint64_t right2_tagged = rightb | q->aid<<40;
-		if(!atomic_compare_exchange_weak_explicit(rp, &right, right2_tagged, memory_order_acquire, memory_order_relaxed))
+		if(!atomic_compare_exchange_weak_explicit(rp, &right, right2_tagged, memory_order_acquire, memory_order_acquire))
 			goto retry;
 
 		uint64_t expected_mapping_size = (char*)&mapping->blocks[rightb] - (char*)mapping;
@@ -224,10 +225,33 @@ static inline uint8_t* _vqueue_try_alloc(struct _vqueue* q, _Atomic uint64_t* rp
 			atomic_compare_exchange_strong_explicit(rp, &right2_tagged, rightb, memory_order_release, memory_order_relaxed);
 		}
 		*mapping_ = mapping;
-		return (uint8_t*)&mapping->blocks[right];
-	}else if(limit != UINT64_MAX){
-		// TODO: close gap with dummy allocation
-		// TODO: set left back to beginning
+		return (uint8_t*)&mapping->blocks[rightm];
+	}else if(limit != UINT64_MAX && limit >= rightm){
+		// All simultaneous accessors see the same limit btw because of how we acquired it
+
+		if(limit > rightm){
+			// dummy allocation
+			uint64_t expected_mapping_size = (char*)&mapping->blocks[rightm] - (char*)mapping;
+			if(!atomic_compare_exchange_weak_explicit(rp, &right, limit, memory_order_acquire, memory_order_acquire))
+				goto retry;
+
+			if(expected_mapping_size > mapping_size)
+				mapping = _vqueue_resize_mapping(q, mapping, &mapping_size, expected_mapping_size);
+			
+			struct _vqueue_msg_hdr* hdr = (struct _vqueue_msg_hdr*)&mapping->blocks[right] - 1;
+			atomic_store_explicit(&hdr->aid, -1u, memory_order_relaxed);
+			atomic_store_explicit(&hdr->size, ((limit-rightm)<<6) - 63, memory_order_relaxed);
+		}
+
+		// Carefully ordered wrap
+		atomic_store_explicit(&mapping->left, 0, memory_order_release);
+		// reader reading right<rinit is inconsequential
+		// we override rp which is limit and cannot have changed, and rip which can be {old, limit} either of which is fine
+		atomic_store_explicit(rp, 0, memory_order_release);
+		atomic_store_explicit(rip, 0, memory_order_release);
+		right = 0;
+		if(_vqueue_trim(q, mapping, 0, false))
+			goto retry;
 	}
 	*mapping_ = mapping;
 	return 0;
@@ -325,7 +349,7 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 	return (vqueue_block_t){atomic_load_explicit(&hdr->size, memory_order_relaxed), hdr->payload};
 }
 
-static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left, bool strict){
+static inline bool _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left, bool strict){
 	uint32_t actual = -1u;
 	acq:
 	if(!atomic_compare_exchange_strong_explicit(&mapping->trim_lock, &actual, q->aid, memory_order_acquire, memory_order_relaxed)){
@@ -334,13 +358,15 @@ static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* 
 			if(!fcntl(q->shmem_fd, F_GETLK, &l) && l.l_type == F_UNLCK)
 				goto acq;
 		}
-		return;
+		return false;
 	}
+	bool cleaned = false;
 	uint64_t end = atomic_load_explicit(&mapping->end, memory_order_relaxed) & 0xFFFFFFFFFF;
 	if(atomic_load_explicit(&mapping->left, memory_order_acquire) == left) while(true){
 		if(left == end){
 			// TODO: double check
 			// TODO: move left to beginning
+			// TODO: end = right; right = 0
 		}
 		struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) &mapping->blocks[left]) - 1;
 		uint32_t aid = atomic_load_explicit(&hdr->aid, memory_order_relaxed);
@@ -348,13 +374,15 @@ static inline void _vqueue_trim(struct _vqueue* q, struct _vqueue_shmem_region* 
 			struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = aid, .l_len = 1};
 			if(!fcntl(q->shmem_fd, F_GETLK, &l) && l.l_type == F_UNLCK) aid = -1u;
 		}
-		if(aid == -1u && _vqueue_check_protect(q, mapping, left)){
+		if(aid == -1u && _vqueue_check(q, mapping, left)){
 			uint64_t next = left + atomic_load_explicit(&hdr->size, memory_order_relaxed) + _VQUEUE_MSG_HDR_SIZE;
 			next += (-next)&63;
 			atomic_store_explicit(&mapping->left, left = next, memory_order_relaxed);
+			cleaned = true;
 		}else break;
 	}
 	atomic_store_explicit(&mapping->trim_lock, -1u, memory_order_release);
+	return cleaned;
 }
 
 static inline void _vqueue_gc(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t left){
@@ -367,6 +395,7 @@ static inline void _vqueue_gc(struct _vqueue* q, struct _vqueue_shmem_region* ma
 			atomic_compare_exchange_strong_explicit(&mapping->hazfield[i], &v, 0, memory_order_relaxed, memory_order_relaxed);
 		}
 	}
+	// todo: finish allocations if needed
 	_vqueue_trim(q, mapping, atomic_load_explicit(&mapping->left, memory_order_relaxed), true);
 }
 

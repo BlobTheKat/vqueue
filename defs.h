@@ -74,7 +74,7 @@ static inline void _vqueue_unprotect(struct _vqueue* q, struct _vqueue_shmem_reg
 	if(atomic_load_explicit(&mapping->left, memory_order_acquire) == ptr) _vqueue_trim(q, mapping, ptr, false);
 }
 
-static inline bool _vqueue_check_protect(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
+static inline bool _vqueue_check(struct _vqueue* q, struct _vqueue_shmem_region* mapping, uint64_t ptr){
 	thread_memory_barrier(mb_co_release);
 	uint64_t h = _vqueue_mix64(ptr);
 	for(unsigned i = 0; i < 8; i++){

@@ -17,7 +17,8 @@ struct _vqueue_shmem_region{
 	sem_t sema4;
 	_Atomic uint32_t open_counter;
 	_Atomic uint32_t trim_lock;
-	_Atomic uint64_t head, tail, left, right, end, rightinit, endinit;
+	_Atomic uint64_t head, tail, left;
+	union{ struct{ _Atomic uint64_t right1, right1init, right2, right2init; }; _Atomic uint64_t right_v[4]; };
 	// 8-way hash table of hazard pointers
 	_Atomic uint64_t hazfield[256];
 	char unused_[_VQUEUE_MSG_HDR_SIZE];
@@ -90,8 +91,8 @@ static inline bool _vqueue_check(struct _vqueue* q, struct _vqueue_shmem_region*
 }
 
 static inline uint64_t _vqueue_pointer_acquire2(struct _vqueue* q, struct _vqueue_shmem_region* mapping, _Atomic uint64_t* ptr, uint64_t v, uint8_t* lock_out){
-	if(!(v&0xFFFFFFFFFF)) return v;
 	retry: {}
+	if((v&0xFFFFFFFFFF) == 0xFFFFFFFFFF) return v;
 	uint8_t n = _vqueue_protect(q, mapping, v);
 	uint64_t v2 = v; v = atomic_load_explicit(ptr, memory_order_acquire);
 	if(v != v2){

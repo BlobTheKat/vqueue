@@ -22,8 +22,6 @@ void vqueue_post(vqueue_t* q, vqueue_block_t block);
 vqueue_block_t vqueue_wait(vqueue_t* q);
 void vqueue_free(vqueue_t* q, vqueue_block_t block);
 
-#if defined(VQUEUE_IMPL) && defined(_WIN32)
-	#include "vqueue_win.c"
-#elif defined(VQUEUE_IMPL) && defined(_POSIX_VERSION)
-	#include "vqueue_posix.c"
+#ifdef VQUEUE_IMPL
+	#include "vqueue_impl.c"
 #endif

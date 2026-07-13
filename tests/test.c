@@ -1,4 +1,3 @@
-#include "a.h"
 #define VQUEUE_IMPL
 #include "vqueue.h"
 #include <stdio.h>
@@ -17,9 +16,9 @@ void* reader_thread(void* _){
 }
 
 int main(){
-	thread_create(reader_thread, 0, 0);
+	thread_t thr = thread_create(reader_thread, 0, 0);
 	if(!vqueue_open(&q, "my_ipc", -1)){
-		fprintf("vqueue_open() failed", stderr); return 1;
+		fprintf(stderr, "vqueue_open() failed"); return 1;
 	}
 
 	// process 1 (writer)
@@ -29,4 +28,6 @@ int main(){
 	memcpy(slot.data, msg, sizeof(msg));
 
 	vqueue_post(&q, slot);
+
+	thread_join(thr);
 }

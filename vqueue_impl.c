@@ -82,7 +82,7 @@ static inline void _vqueue_release_mapping(struct _vqueue_mapping ctx){
 	}
 }
 
-static inline void _vqueue_resize_mapping(struct _vqueue_mapping* ctx, uint8_t size_packed){
+static void _vqueue_resize_mapping(struct _vqueue_mapping* ctx, uint8_t size_packed){
 	struct _vqueue* q = ctx->q;
 	uint64_t old1 = (uint64_t)ctx->data >> 6;
 	uint64_t newsize = _vqueue_uncompress_size(size_packed);
@@ -146,20 +146,21 @@ bool vqueue_open(vqueue_t* q, const char* name, size_t name_sz){
 #endif
 	q->mapping.size_packed = _vqueue_compress_size(_VQUEUE_INIT_MAPPING);
 	uint64_t sz = _vqueue_uncompress_size(q->mapping.size_packed);
+	struct stat st;
+	fstat(q->shmem_fd, &st);
 	struct _vqueue_shmem_region* mapping = _vqueue_mmap(q->shmem_fd, 0, sz);
-	if(mapping == (void*)-1){ // TODO: properly synchronize opening
-		// Init perhaps
+	if(st.st_size < sizeof(struct _vqueue_shmem_region) || !atomic_load_explicit(&mapping->lsize, memory_order_acquire)){
 		struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0x1000000, .l_len = 1 };
 		if(fcntl(q->shmem_fd, F_SETLKW, &l)) goto err;
-		struct stat st;
 		if(fstat(q->shmem_fd, &st)) goto err;
-		if(st.st_size < sz) if(ftruncate(q->shmem_fd, sz)) goto err;
-		struct _vqueue_shmem_region* mapping = _vqueue_mmap(q->shmem_fd, 0, sz);
-		if(mapping == (void*)-1) goto err;
-		atomic_init(&mapping->head, _VQUEUE_PTR_INVALID);
-		atomic_init(&mapping->tail, _VQUEUE_PTR_INVALID);
-		atomic_init(&mapping->trim_lock, -1u);
-		atomic_init(&mapping->lsize, sz);
+		if(st.st_size < sizeof(struct _vqueue_shmem_region)){
+			if(ftruncate(q->shmem_fd, sz)) goto err;
+			atomic_init(&mapping->head, _VQUEUE_PTR_INVALID);
+			atomic_init(&mapping->tail, _VQUEUE_PTR_INVALID);
+			atomic_init(&mapping->trim_lock, -1u);
+			atomic_thread_fence(memory_order_release);
+			atomic_init(&mapping->lsize, sz);
+		}
 		l.l_type = F_UNLCK;
 		if(fcntl(q->shmem_fd, F_SETLKW, &l)) goto err;
 	}

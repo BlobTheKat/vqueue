@@ -43,7 +43,8 @@ struct _vqueue_shmem_region{
 #define _vqueue_offsetof(member) ((&((struct _vqueue_shmem_region*)0)->member)-(_Atomic uint64_t*)0)
 
 struct _vqueue_mapping_descriptor{
-	_Atomic uint64_t ref;
+	lock_t lock;
+	_Atomic uint32_t ref;
 	uint64_t ptr:40, size_packed:24;
 	struct _vqueue_mapping_descriptor *next;
 };
@@ -57,7 +58,6 @@ struct _vqueue_mapping{
 struct _vqueue{
 	int shmem_fd;
 	uint32_t aid;
-	lock_t mapping_lock;
 	struct _vqueue_mapping_descriptor mapping;
 };
 

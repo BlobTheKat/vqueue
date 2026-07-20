@@ -15,20 +15,23 @@
 #endif
 
 struct _vqueue_msg_hdr{
-	// High bits used to indicate whether it has been claimed from the queue yet
-	_Atomic uint32_t aid;
+	// Bit 24 used to indicate whether it has been claimed from the queue yet
+#if SIZE_MAX == UINT32_MAX
+#define _VQUEUE_MSG_HDR_SIZE sizeof(struct _vqueue_msg_hdr)
+	_Atomic uint32_t aid, size;
+#else
+#define _VQUEUE_MSG_HDR_SIZE sizeof(struct _vqueue_msg_hdr)-4
+	_Atomic uint32_t _, aid;
 	_Atomic size_t size;
+#endif
 	_Atomic uint64_t next;
 	uint8_t payload[];
 };
-#define _VQUEUE_MSG_HDR_SIZE sizeof(struct _vqueue_msg_hdr)-4
 
 struct _vqueue_shmem_region{
 	sem_t sema4;
-	_Atomic uint32_t open_counter;
-	_Atomic uint32_t trim_lock;
-	_Atomic uint64_t lsize;
-	_Atomic uint64_t head, tail, left;
+	_Atomic uint32_t open_counter, trim_lock;
+	_Atomic uint64_t lsize, head, tail, left;
 	_Atomic uint64_t right1, right1init, right2, right2init;
 	// 8-way hash table of hazard pointers
 	_Atomic uint64_t hazarena[256];
@@ -36,7 +39,7 @@ struct _vqueue_shmem_region{
 	_Alignas(64) char blocks[][64];
 };
 
-#define _vqueue_offsetof(member) ((size_t) &((struct _vqueue_shmem_region*)0)->member)
+#define _vqueue_offsetof(member) ((&((struct _vqueue_shmem_region*)0)->member)-(_Atomic uint64_t*)0)
 
 struct _vqueue_mapping_descriptor{
 	_Atomic uint64_t ref;
@@ -92,6 +95,7 @@ static inline uint8_t _vqueue_protect(struct _vqueue_mapping* ctx, uint64_t ptr)
 static inline bool _vqueue_trim(struct _vqueue_mapping*, uint64_t, bool);
 
 static inline void _vqueue_unprotect(struct _vqueue_mapping* ctx, uint64_t ptr, uint8_t n){
+	if(ptr == _VQUEUE_PTR_INVALID) return;
 	atomic_store_explicit(&ctx->data->hazarena[n], 0, memory_order_release);
 	if(atomic_load_explicit(&ctx->data->left, memory_order_acquire) == ptr) _vqueue_trim(ctx, ptr, false);
 }
@@ -115,7 +119,7 @@ static inline bool _vqueue_check(struct _vqueue_mapping* ctx, uint64_t ptr){
 
 static inline uint64_t _vqueue_pointer_acquire2(struct _vqueue_mapping* ctx, size_t ptr, uint64_t v, uint8_t* lock_out){
 	retry: {}
-	if((v&0xFFFFFFFFFF) == 0xFFFFFFFFFF) return v;
+	if(v == _VQUEUE_PTR_INVALID) return v;
 	uint8_t n = _vqueue_protect(ctx, v);
 	uint64_t v2 = v; v = atomic_load_explicit(ctx->data8+ptr, memory_order_acquire);
 	if(v != v2){

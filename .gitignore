@@ -1,0 +1,6 @@
+.vscode
+*.dSYM
+*.out
+*.o
+*.bin
+tmp

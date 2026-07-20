@@ -19,6 +19,7 @@ int main(){
 	if(!vqueue_open(&q, "my_ipc", -1)){
 		fprintf(stderr, "vqueue_open() failed"); return 1;
 	}
+	printf("aid=%u\n", q.aid);
 	thread_t thr = thread_create(reader_thread, 0, 0);
 
 	// process 1 (writer)

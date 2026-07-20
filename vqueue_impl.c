@@ -543,6 +543,7 @@ static inline bool _vqueue_trim(struct _vqueue_mapping* ctx, uint64_t left, bool
 			}
 		}else break;
 	}
+	if(cleaned || strict) atomic_store_explicit(&ctx->data->failed_trim, 0, memory_order_relaxed);
 	atomic_store_explicit(&ctx->data->trim_lock, 0xFFFFFFFF, memory_order_release);
 	return cleaned;
 }
@@ -552,7 +553,11 @@ void vqueue_free(vqueue_t* q, vqueue_block_t block){
 	uint64_t ptr = (char(*)[64])block.data - ctx.data->blocks;
 	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) block.data) - 1;
 	atomic_store_explicit(&hdr->aid, 0xFFFFFFFF, memory_order_relaxed);
-	if(atomic_load_explicit(&ctx.data->left, memory_order_acquire) == ptr)
-		_vqueue_trim(&ctx, ptr, false);
+	if(atomic_load_explicit(&ctx.data->left, memory_order_acquire) != ptr || !_vqueue_trim(&ctx, ptr, false)){
+		uint64_t failed_trim = atomic_fetch_add_explicit(&ctx.data->failed_trim, block.size, memory_order_relaxed) + block.size;
+		uint64_t lsize = atomic_load_explicit(&ctx.data->lsize, memory_order_relaxed);
+		if(failed_trim >= (lsize >> 1))
+			_vqueue_trim(&ctx, ptr, true);
+	}
 	_vqueue_release_mapping(ctx);
 }

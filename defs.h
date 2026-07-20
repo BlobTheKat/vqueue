@@ -31,7 +31,8 @@ struct _vqueue_msg_hdr{
 struct _vqueue_shmem_region{
 	sem_t sema4;
 	_Atomic uint32_t open_counter, trim_lock;
-	_Atomic uint64_t lsize, head, tail, left;
+	_Atomic uint64_t failed_trim, lsize;
+	_Atomic uint64_t head, tail, left;
 	_Atomic uint64_t right1, right1init, right2, right2init;
 	// 8-way hash table of hazard pointers
 	_Atomic uint64_t hazarena[256];

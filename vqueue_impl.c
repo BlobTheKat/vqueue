@@ -251,7 +251,7 @@ static inline void _vqueue_finish_pending_alloc(struct _vqueue_mapping* ctx, uin
 		if(emsz > ctx->size) _vqueue_resize_mapping(ctx, emsz);
 		struct _vqueue_msg_hdr* hdr = (struct _vqueue_msg_hdr*)&ctx->data->blocks[rinit] - 1;
 		uint32_t aid2 = atomic_load_explicit(&hdr->aid, memory_order_relaxed);
-		while(aid2 != 0xFFFFFFFF && !atomic_compare_exchange_weak_explicit(&hdr->aid, &aid2, *v_>>40, memory_order_relaxed, memory_order_relaxed));
+		while(aid2 != 0xFFFFFFFF && !atomic_compare_exchange_weak_explicit(&hdr->aid, &aid2, 0x1000000|*v_>>40, memory_order_relaxed, memory_order_relaxed));
 		// safe init that writes what gc pass would need but yields to the more precise value written by the actual allocating thread
 		size_t sz2 = vm - rinit - _VQUEUE_MSG_HDR_SIZE - 63, sz = atomic_load_explicit(&hdr->size, memory_order_relaxed);
 		while(((sz - sz2)>>6) && !atomic_compare_exchange_weak_explicit(&hdr->size, &sz, sz2, memory_order_relaxed, memory_order_relaxed));
@@ -337,7 +337,7 @@ static uint8_t* _vqueue_try_alloc(struct _vqueue_mapping* ctx, uint64_t rp, uint
 	
 	struct _vqueue_msg_hdr* hdr = (struct _vqueue_msg_hdr*)&ctx->data->blocks[v] - 1;
 	atomic_store_explicit(&hdr->next, _VQUEUE_PTR_INVALID, memory_order_relaxed);
-	atomic_store_explicit(&hdr->aid, ctx->q->aid, memory_order_relaxed);
+	atomic_store_explicit(&hdr->aid, 0x1000000|ctx->q->aid, memory_order_relaxed);
 	atomic_store_explicit(&hdr->size, size, memory_order_relaxed);
 
 	if(atomic_compare_exchange_strong_explicit(ctx->data8+rip, &v, v2, memory_order_relaxed, memory_order_relaxed))
@@ -430,7 +430,7 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 	uint32_t v = atomic_load_explicit(&hdr->aid, memory_order_relaxed);
 	uint64_t ptr2 = atomic_load_explicit(&hdr->next, memory_order_relaxed);
 	retry2:
-	if(v >> 24){
+	if(!(v & 0x1000000)){
 		// Someone else acquired it, we find next message
 		_vqueue_unprotect(&ctx, ptr&0xFFFFFFFFFF, n);
 		n = _vqueue_protect(&ctx, ptr2);
@@ -442,7 +442,7 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 		}
 		goto find_next;
 	}
-	if(!atomic_compare_exchange_strong_explicit(&hdr->aid, &v, q->aid|0x1000000, memory_order_relaxed, memory_order_relaxed)) goto retry2;
+	if(!atomic_compare_exchange_strong_explicit(&hdr->aid, &v, q->aid, memory_order_relaxed, memory_order_relaxed)) goto retry2;
 	uint64_t ptr1 = ptr;
 	atomic_compare_exchange_strong_explicit(&ctx.data->head, &ptr1, ptr2, memory_order_release, memory_order_relaxed);
 	ptr1 = ptr;
@@ -473,6 +473,16 @@ static inline bool _vqueue_trim(struct _vqueue_mapping* ctx, uint64_t left, bool
 		}
 		return false;
 	}
+	if(strict){
+		uint64_t ptr = atomic_load_explicit(&ctx->data->head, memory_order_acquire)&0xFFFFFFFFFF;
+		while(ptr != _VQUEUE_PTR_INVALID){
+			size_t emsz = _vqueue_compress_size((char*)ctx->data->blocks[ptr] - (char*)ctx->data);
+			if(emsz > ctx->size) _vqueue_resize_mapping(ctx, emsz);
+			struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) &ctx->data->blocks[ptr]) - 1;
+			atomic_fetch_or_explicit(&hdr->aid, 0x2000000, memory_order_relaxed);
+			ptr = atomic_load_explicit(&hdr->next, memory_order_acquire)&0xFFFFFFFFFF;
+		}
+	}
 	bool cleaned = false;
 	uint64_t r1 = atomic_load_explicit(&ctx->data->right1, memory_order_relaxed);
 	uint64_t r2 = atomic_load_explicit(&ctx->data->right2, memory_order_relaxed);
@@ -484,15 +494,14 @@ static inline bool _vqueue_trim(struct _vqueue_mapping* ctx, uint64_t left, bool
 	while(left < rmax){
 		struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) &ctx->data->blocks[left]) - 1;
 		uint32_t aid = atomic_load_explicit(&hdr->aid, memory_order_relaxed);
-		if(strict && aid != 0xFFFFFFFF){
-			struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = aid, .l_len = 1};
+		if(strict && (aid&0x3000000) != 0x3000000){
+			struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = aid&0xFFFFFF, .l_len = 1};
 			if(!fcntl(ctx->q->shmem_fd, F_GETLK, &l) && l.l_type == F_UNLCK) aid = 0xFFFFFFFF;
 		}
 		if(aid == 0xFFFFFFFF && _vqueue_check(ctx, left)){
 			uint64_t next = left + ((atomic_load_explicit(&hdr->size, memory_order_relaxed) + _VQUEUE_MSG_HDR_SIZE + 63) >> 6);
 			cleaned = true;
 			recheck:
-			printf("%llu, %llu\n", next, rmax);
 			if(next == rmax){
 				uint64_t mark = _VQUEUE_PTR_INVALID|256ull<<40;
 				if(!atomic_compare_exchange_strong_explicit(ctx->data8+right, &rmax, mark, memory_order_relaxed, memory_order_relaxed)){

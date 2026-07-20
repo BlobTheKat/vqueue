@@ -32,7 +32,7 @@ static inline struct _vqueue_mapping _vqueue_acquire_mapping(struct _vqueue* q){
 	struct _vqueue_shmem_region* region = (struct _vqueue_shmem_region*)(q->mapping.ptr<<6);
 	size_t sz = _vqueue_uncompress_size(q->mapping.size_packed);
 	lock_release(&q->mapping.lock, 1);
-	return (struct _vqueue_mapping){q, region, sz};
+	return (struct _vqueue_mapping){q, {.data = region}, sz};
 }
 
 static inline struct _vqueue_mapping _vqueue_acquire_mapping_for(struct _vqueue* q, char* thing){
@@ -43,13 +43,13 @@ static inline struct _vqueue_mapping _vqueue_acquire_mapping_for(struct _vqueue*
 	uint64_t sz = _vqueue_uncompress_size(v->size_packed);
 	if(thing >= region && thing < region + sz){
 		lock_release(&q->mapping.lock, 1);
-		return (struct _vqueue_mapping){q, (struct _vqueue_shmem_region*)region, sz};
+		return (struct _vqueue_mapping){q, {.data = (struct _vqueue_shmem_region*)region}, sz};
 	}
 	v = v->next;
 	if(v) goto next;
 	else{
 		lock_release(&q->mapping.lock, 1);
-		return (struct _vqueue_mapping){q, 0, 0};
+		return (struct _vqueue_mapping){q, {0}, 0};
 	}
 }
 
@@ -149,11 +149,11 @@ bool vqueue_open(vqueue_t* q, const char* name, size_t name_sz){
 	struct stat st;
 	fstat(q->shmem_fd, &st);
 	struct _vqueue_shmem_region* mapping = _vqueue_mmap(q->shmem_fd, 0, sz);
-	if(st.st_size < sizeof(struct _vqueue_shmem_region) || !atomic_load_explicit(&mapping->lsize, memory_order_acquire)){
+	if((size_t)st.st_size < sizeof(struct _vqueue_shmem_region) || !atomic_load_explicit(&mapping->lsize, memory_order_acquire)){
 		struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0x1000000, .l_len = 1 };
 		if(fcntl(q->shmem_fd, F_SETLKW, &l)) goto err;
 		if(fstat(q->shmem_fd, &st)) goto err;
-		if(st.st_size < sizeof(struct _vqueue_shmem_region)){
+		if((size_t)st.st_size < sizeof(struct _vqueue_shmem_region)){
 			if(ftruncate(q->shmem_fd, sz)) goto err;
 			atomic_init(&mapping->head, _VQUEUE_PTR_INVALID);
 			atomic_init(&mapping->tail, _VQUEUE_PTR_INVALID);
@@ -328,7 +328,7 @@ static uint8_t* _vqueue_try_alloc(struct _vqueue_mapping* ctx, uint64_t rp, uint
 		if(fcntl(fd, F_SETLKW, &l)) err: abort();
 		struct stat st;
 		if(fstat(fd, &st)) goto err;
-		if(st.st_size < expected_mapping_size) if(ftruncate(fd, expected_mapping_size)) goto err;
+		if((size_t)st.st_size < expected_mapping_size) if(ftruncate(fd, expected_mapping_size)) goto err;
 		l.l_type = F_UNLCK;
 		atomic_store_explicit(&ctx->data->lsize, expected_mapping_size, memory_order_release);
 		if(fcntl(fd, F_SETLKW, &l)) goto err;
@@ -520,7 +520,7 @@ static inline bool _vqueue_trim(struct _vqueue_mapping* ctx, uint64_t left, bool
 				atomic_compare_exchange_strong_explicit(ctx->data8+right, &mark, 0, memory_order_release, memory_order_relaxed);
 				if(right == _vqueue_offsetof(right1)){ r1 = 0; rmax = r2; }else{ r2 = 0; rmax = r1; }
 				right = rmax == r2 ? _vqueue_offsetof(right2) : _vqueue_offsetof(right1);
-				if(((char*)ctx->data->blocks[rmax] - (char*)ctx->data) < atomic_load_explicit(&ctx->data->lsize, memory_order_acquire)>>1){
+				if((uint64_t)((char*)ctx->data->blocks[rmax] - (char*)ctx->data) < atomic_load_explicit(&ctx->data->lsize, memory_order_acquire)>>1){
 					int fd = ctx->q->shmem_fd;
 					struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = 0x1000000, .l_len = 1 };
 					if(!fcntl(fd, F_SETLKW, &l)){

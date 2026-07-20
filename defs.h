@@ -40,7 +40,7 @@ struct _vqueue_shmem_region{
 	_Alignas(64) char blocks[][64];
 };
 
-#define _vqueue_offsetof(member) ((&((struct _vqueue_shmem_region*)0)->member)-(_Atomic uint64_t*)0)
+#define _vqueue_offsetof(member) ((&((struct _vqueue_shmem_region*)0x10000)->member)-(_Atomic uint64_t*)0x10000)
 
 struct _vqueue_mapping_descriptor{
 	lock_t lock;
@@ -146,7 +146,7 @@ static inline uint8_t _vqueue_compress_size(size_t sz){
 #endif
 	magn -= 2;
 	sz += (1ull<<magn)-1;
-	return (magn-13)<<1 | (sz>>magn)&1;
+	return (magn-13)<<1 | ((sz>>magn)&1);
 }
 static inline size_t _vqueue_round_size(size_t sz){
 	size_t mask = 16383;
@@ -165,7 +165,7 @@ static inline size_t _vqueue_round_size(size_t sz){
 }
 static inline size_t _vqueue_uncompress_size(uint8_t x){
 	if(x <= 4) return x<<14;
-	return (x&3|2)<<((x>>1)+13);
+	return ((x&3)|2)<<((x>>1)+13);
 }
 
 _Static_assert(ATOMIC_INT64_LOCK_FREE, "atomic uint64_t is not lock-free. Non-lock-free atomics do not work on shared memory");

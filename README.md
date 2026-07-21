@@ -13,7 +13,6 @@ int main(){
 	if(!vqueue_open(&q, "my_ipc", -1)){
 		fprintf(stderr, "vqueue_open() failed"); return 1;
 	}
-	thread_create(reader, 0, 0);
 
 
 	char msg[] = "Hello, world!";

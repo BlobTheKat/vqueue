@@ -1,4 +1,3 @@
-#pragma once
 #define _FILE_OFFSET_BITS 64
 #include <vqueue.h>
 #include <limits.h>

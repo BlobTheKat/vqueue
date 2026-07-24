@@ -142,7 +142,7 @@ static inline uint8_t _vqueue_compress_size(size_t sz){
 #ifdef _MSC_VER
 	if(_BitScanReverse64(&magn, sz)) magn++;
 #else
-	magn = __LLONG_WIDTH__-__builtin_clzll(sz);
+	magn = sizeof(long long)*CHAR_BIT-__builtin_clzll(sz);
 #endif
 	magn -= 2;
 	sz += (1ull<<magn)-1;
@@ -156,7 +156,7 @@ static inline size_t _vqueue_round_size(size_t sz){
 #ifdef _MSC_VER
 		if(_BitScanReverse64(&magn, sz)) magn++;
 #else
-		magn = __LLONG_WIDTH__-__builtin_clzll(sz);
+		magn = sizeof(long long)*CHAR_BIT-__builtin_clzll(sz);
 #endif
 		mask = (1ull<<(magn-2))-1;
 	}

@@ -1,6 +1,6 @@
 # <img src="./vq-icon.png" alt="V logo" width="72" style="vertical-align: middle; margin-right: 12px" /> **Vqueue**
 
-Blazingly fast copy-less IPC.
+Crazy fast copy-less IPC.
 
 ```c
 #define VQUEUE_IMPL

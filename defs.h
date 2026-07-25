@@ -136,7 +136,7 @@ static inline uint64_t _vqueue_pointer_acquire(struct _vqueue_mapping* ctx, size
 }
 
 static inline uint8_t _vqueue_compress_size(size_t sz){
-	if(sz <= 65536) return sz>>14;
+	if(sz <= 81920) return (sz+16383)>>14;
 	unsigned long magn = 0;
 	// 64-clz64(x)
 #ifdef _MSC_VER

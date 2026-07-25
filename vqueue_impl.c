@@ -34,7 +34,7 @@ static inline struct _vqueue_mapping _vqueue_acquire_mapping(struct _vqueue* q){
 	return (struct _vqueue_mapping){q, {.data = region}, sz};
 }
 
-static inline struct _vqueue_mapping _vqueue_acquire_mapping_for(struct _vqueue* q, char* thing){
+static inline struct _vqueue_mapping _vqueue_get_mapping_for(struct _vqueue* q, char* thing){
 	lock_acquire(&q->mapping.lock, 1);
 	struct _vqueue_mapping_descriptor* v = &q->mapping;
 	next: {}
@@ -64,7 +64,7 @@ static inline void _vqueue_release_mapping(struct _vqueue_mapping ctx){
 	while(v){
 		if(v->ptr != ptr1){ v = v->next; continue; }
 		
-		bool finished = atomic_fetch_sub_explicit(&ctx.q->mapping.ref, 1, memory_order_relaxed) == 1;
+		bool finished = atomic_fetch_sub_explicit(&v->ref, 1, memory_order_relaxed) == 1;
 		lock_release(&ctx.q->mapping.lock, 1);
 		if(finished){
 			munmap(ctx.data8, _vqueue_uncompress_size(ctx.size));
@@ -92,18 +92,8 @@ static void _vqueue_resize_mapping(struct _vqueue_mapping* ctx, uint8_t size_pac
 		lock_release(&q->mapping.lock, LOCK_MAX);
 		return;
 	}
-	struct _vqueue_shmem_region* new_map = _vqueue_mmap(q->shmem_fd, 0, newsize);
-	if(atomic_load_explicit(&q->mapping.ref, memory_order_relaxed) > 1){
-		// mapping still in use
-		struct _vqueue_mapping_descriptor* desc = malloc(sizeof(struct _vqueue_mapping_descriptor));
-		atomic_init(&desc->ref, 0);
-		desc->next = q->mapping.next;
-		desc->ptr = q->mapping.ptr; desc->size_packed = q->mapping.size_packed;
-		q->mapping.next = desc;
-		atomic_init(&q->mapping.ref, 1);
-	}else if(old1 == q->mapping.ptr){
-		munmap(ctx->data8, _vqueue_uncompress_size(ctx->size));
-	}else{
+	bool is_top = old1 == q->mapping.ptr;
+	if(!is_top){
 		struct _vqueue_mapping_descriptor** ov = &q->mapping.next, *v = *ov;
 		while(v){
 			if(v->ptr != old1){ v = *(ov = &v->next); continue; }
@@ -114,6 +104,19 @@ static void _vqueue_resize_mapping(struct _vqueue_mapping* ctx, uint8_t size_pac
 			}
 			break;
 		}
+	}
+	struct _vqueue_shmem_region* new_map = _vqueue_mmap(q->shmem_fd, 0, newsize);
+	uint64_t ref = atomic_load_explicit(&q->mapping.ref, memory_order_relaxed);
+	if(ref > is_top){
+		// mapping still in use
+		struct _vqueue_mapping_descriptor* desc = malloc(sizeof(struct _vqueue_mapping_descriptor));
+		atomic_init(&desc->ref, ref - is_top);
+		desc->next = q->mapping.next;
+		desc->ptr = q->mapping.ptr; desc->size_packed = q->mapping.size_packed;
+		q->mapping.next = desc;
+		atomic_init(&q->mapping.ref, 1);
+	}else{
+		munmap((void*)(q->mapping.ptr<<6), _vqueue_uncompress_size(q->mapping.size_packed));
 	}
 	q->mapping.ptr = (uint64_t)new_map >> 6;
 	q->mapping.size_packed = size_packed;
@@ -366,7 +369,7 @@ vqueue_block_t vqueue_alloc(vqueue_t* q, size_t size){
 	goto retry;
 }
 void vqueue_post(vqueue_t* q, vqueue_block_t block){
-	struct _vqueue_mapping ctx = _vqueue_acquire_mapping_for(q, (char*)block.data);
+	struct _vqueue_mapping ctx = _vqueue_get_mapping_for(q, (char*)block.data);
 	uint64_t new_ptr = ((char(*)[64])block.data - ctx.data->blocks) | (uint64_t)_vqueue_compress_size((char*)(block.data+block.size) - (char*)ctx.data)<<40;
 	uint8_t n;
 	uint64_t ptr = atomic_load_explicit(&ctx.data->tail, memory_order_relaxed)&0xFFFFFFFFFF;
@@ -548,7 +551,7 @@ static inline bool _vqueue_trim(struct _vqueue_mapping* ctx, uint64_t left, bool
 }
 
 void vqueue_free(vqueue_t* q, vqueue_block_t block){
-	struct _vqueue_mapping ctx = _vqueue_acquire_mapping_for(q, (char*)block.data);
+	struct _vqueue_mapping ctx = _vqueue_get_mapping_for(q, (char*)block.data);
 	uint64_t ptr = (char(*)[64])block.data - ctx.data->blocks;
 	struct _vqueue_msg_hdr* hdr = ((struct _vqueue_msg_hdr*) block.data) - 1;
 	atomic_store_explicit(&hdr->aid, 0xFFFFFFFF, memory_order_relaxed);

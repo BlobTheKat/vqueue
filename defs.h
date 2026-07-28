@@ -35,7 +35,7 @@ struct _vqueue_shmem_region{
 	_Atomic uint64_t head, tail, left;
 	_Atomic uint64_t right1, right1init, right2, right2init;
 	// 8-way hash table of hazard pointers
-	_Atomic uint64_t hazarena[256];
+	_Atomic uint64_t haztable[256];
 	char unused_[_VQUEUE_MSG_HDR_SIZE];
 	_Alignas(64) char blocks[][64];
 };
@@ -75,7 +75,7 @@ static inline uint8_t _vqueue_protect(struct _vqueue_mapping* ctx, uint64_t ptr)
 		uint8_t n = h|((h2+i)&7);
 		uint64_t current = 0;
 		retry:
-		if(atomic_compare_exchange_strong_explicit(&ctx->data->hazarena[n], &current, ptr, memory_order_acquire, memory_order_relaxed)){
+		if(atomic_compare_exchange_strong_explicit(&ctx->data->haztable[n], &current, ptr, memory_order_acquire, memory_order_relaxed)){
 			//thread_memory_barrier(mb_co_acquire); // cmpxchg acquired, even though we discarded the result this is still good
 			return n;
 		}
@@ -95,7 +95,7 @@ static inline bool _vqueue_trim(struct _vqueue_mapping*, uint64_t, bool);
 
 static inline void _vqueue_unprotect(struct _vqueue_mapping* ctx, uint64_t ptr, uint8_t n){
 	if(ptr == _VQUEUE_PTR_INVALID) return;
-	atomic_store_explicit(&ctx->data->hazarena[n], 0, memory_order_release);
+	atomic_store_explicit(&ctx->data->haztable[n], 0, memory_order_release);
 	if(atomic_load_explicit(&ctx->data->left, memory_order_acquire) == ptr) _vqueue_trim(ctx, ptr, false);
 }
 
@@ -103,7 +103,7 @@ static inline bool _vqueue_check(struct _vqueue_mapping* ctx, uint64_t ptr){
 	thread_memory_barrier(mb_co_release);
 	uint8_t h = _vqueue_mix64(ptr), h2 = h&7; h &= ~7;
 	for(unsigned i = 0; i < 8; i++){
-		_Atomic uint64_t* slot = &ctx->data->hazarena[h|((h2+i)&7)];
+		_Atomic uint64_t* slot = &ctx->data->haztable[h|((h2+i)&7)];
 		uint64_t val = atomic_load_explicit(slot, memory_order_relaxed);
 		if(((~val) & 0xFFFFFFFFFF) == ptr){
 			// Ownership transferred

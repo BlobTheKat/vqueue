@@ -457,11 +457,11 @@ static inline bool _vqueue_trim(struct _vqueue_mapping* ctx, uint64_t left, bool
 	if(strict){
 		struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_len = 1 };
 		for(unsigned i = 0; i < 256; i++){
-			uint64_t v = atomic_load_explicit(&ctx->data->hazarena[i], memory_order_relaxed);
+			uint64_t v = atomic_load_explicit(&ctx->data->haztable[i], memory_order_relaxed);
 			if(!v) continue;
 			l.l_start = (uint32_t)(~v>>40);
 			if(!fcntl(ctx->q->shmem_fd, F_GETLK, &l) && l.l_type == F_UNLCK){
-				atomic_compare_exchange_strong_explicit(&ctx->data->hazarena[i], &v, 0, memory_order_relaxed, memory_order_relaxed);
+				atomic_compare_exchange_strong_explicit(&ctx->data->haztable[i], &v, 0, memory_order_relaxed, memory_order_relaxed);
 			}
 		}
 	}

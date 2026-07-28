@@ -62,22 +62,21 @@ struct _vqueue{
 };
 
 static inline uint64_t _vqueue_mix64(uint64_t x){
-	x *= 0xbf58476d1ce4e5b9ULL;
+	x *= 0x1ce4e5b9u;
 	x ^= x >> 27; x ^= x >> 31;
 	return x;
 }
 
 // "Protect" a pointer
 static inline uint8_t _vqueue_protect(struct _vqueue_mapping* ctx, uint64_t ptr){
-	uint64_t h = _vqueue_mix64(ptr);
-	h &= 0xFF00FF00FF00FFULL;
-	h |= h<<8; h ^= 0x0100010001000100ULL;
+	uint8_t h = _vqueue_mix64(ptr), h2 = h&7; h &= ~7;
 	ptr = ~(ptr|(uint64_t)ctx->q->aid<<40);
 	for(unsigned i = 0; ; i++){
-		uint8_t n = h>>((i&7)*8)&255;
+		uint8_t n = h|((h2+i)&7);
 		uint64_t current = 0;
 		retry:
 		if(atomic_compare_exchange_strong_explicit(&ctx->data->hazarena[n], &current, ptr, memory_order_acquire, memory_order_relaxed)){
+			//thread_memory_barrier(mb_co_acquire); // cmpxchg acquired, even though we discarded the result this is still good
 			return n;
 		}
 		if(i >= 63){
@@ -90,7 +89,6 @@ static inline uint8_t _vqueue_protect(struct _vqueue_mapping* ctx, uint64_t ptr)
 		}
 		if(i >= 15) thread_yield();
 	}
-	thread_memory_barrier(mb_co_acquire);
 }
 
 static inline bool _vqueue_trim(struct _vqueue_mapping*, uint64_t, bool);
@@ -103,11 +101,9 @@ static inline void _vqueue_unprotect(struct _vqueue_mapping* ctx, uint64_t ptr, 
 
 static inline bool _vqueue_check(struct _vqueue_mapping* ctx, uint64_t ptr){
 	thread_memory_barrier(mb_co_release);
-	uint64_t h = _vqueue_mix64(ptr);
-	h &= 0xFF00FF00FF00FFULL;
-	h |= h<<8; h ^= 0x0100010001000100ULL;
+	uint8_t h = _vqueue_mix64(ptr), h2 = h&7; h &= ~7;
 	for(unsigned i = 0; i < 8; i++){
-		_Atomic uint64_t* slot = &ctx->data->hazarena[h>>((i&7)*8)&255];
+		_Atomic uint64_t* slot = &ctx->data->hazarena[h|((h2+i)&7)];
 		uint64_t val = atomic_load_explicit(slot, memory_order_relaxed);
 		if(((~val) & 0xFFFFFFFFFF) == ptr){
 			// Ownership transferred

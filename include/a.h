@@ -44,9 +44,11 @@
 #elif defined(_MSC_VER) || defined(__OpenBSD__)
 	#if defined(_MSC_VER)
 		#include <stdlib.h>
+		#include <intrin.h>
 		#define bswap_16(x) _byteswap_ushort(x)
 		#define bswap_32(x) _byteswap_ulong(x)
 		#define bswap_64(x) _byteswap_uint64(x)
+		#define _atomic_weaklink __declspec(selectany)
 	#else
 		#include <sys/types.h>
 		#include <sys/endian.h>
@@ -79,8 +81,11 @@
 	#include <byteswap.h>
 	#include <endian.h>
 #endif
+#ifndef _atomic_weaklink
+	#define _atomic_weaklink __attribute__((weak)) // GCC / clang
+#endif
 
-_Atomic uint32_t _atomic_waiter_pool[32];
+_atomic_weaklink _Atomic uint32_t _atomic_waiter_pool[32];
 // `lock_t` is a simple 32-bit semaphore primitive, it can be used as a mutex, semaphore, barrier, condition variable, etc...
 // It is guaranteed to be the most efficient waiting primitive on the platform. All operations best-case-scenario (i.e uncontended) are also guaranteed to be free from kernel context switch.
 // This type is implemented with futexes on linux/openbsd, `_umtx` on freebsd, `ulock` on macos, `WaitOnAddress` on windows and `sched_yield` on other POSIX systems.
@@ -94,15 +99,6 @@ typedef _Atomic uint32_t lock_t;
 	#define atomic _Atomic
 	#define thread_local _Thread_local
 #endif
-
-typedef _Atomic(uint8_t) atomic_uint8_t;
-typedef _Atomic(int8_t) atomic_int8_t;
-typedef _Atomic(uint16_t) atomic_uint16_t;
-typedef _Atomic(int16_t) atomic_int16_t;
-typedef _Atomic(uint32_t) atomic_uint32_t;
-typedef _Atomic(int32_t) atomic_int32_t;
-typedef _Atomic(uint64_t) atomic_uint64_t;
-typedef _Atomic(int64_t) atomic_int64_t;
 
 // Number of seconds in a microsecond (the unit used by all time-related functions in this library). Equal to one million (1,000,000) as a type of at least 64 bits
 #define SECOND_US 1000000ull
@@ -118,10 +114,6 @@ typedef enum{
 	// `THREAD_PRIO_REALTIME` is for threads performing time-sensitive work. Using this priority for everything is not recommended as it may unnecessarily starve normal priority threads. The OS is also free to ignore the hint or kill the process if abused.
 	THREAD_PRIO_REALTIME
 } thread_priority_t;
-
-#if defined(_MSC_VER)
-	#include <intrin.h>
-#endif
 
 // Memory barrier flags. These can be used with `thread_memory_barrier` to create custom memory barriers with specific ordering constraints, or with `static_memory_barrier` for compiler-only barriers. The `mb_acquire`, `mb_release`, `mb_acq_rel` and `mb_seq_cst` flags are provided for convenience and are equivalent to the corresponding C11 memory orders. The other flags can be used to create more fine-grained barriers.
 typedef enum memory_barrier_t{
@@ -389,8 +381,8 @@ struct _thread_t{
 
 static inline size_t available_concurrency(void){ DWORD n = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS); return n <= 0 ? 1 : n; }
 
-_Thread_local thread_t _a_thread_self = (thread_t)-1;
-_Thread_local _Atomic uint8_t _a_park_flag = 0;
+_atomic_weaklink _Thread_local thread_t _a_thread_self = (thread_t)-1;
+_atomic_weaklink _Thread_local _Atomic uint8_t _a_park_flag = 0;
 
 static inline DWORD WINAPI _thread_wrapper(void* a_){
 	struct _thread_t* a = _a_thread_self = (struct _thread_t*)a_;
@@ -743,7 +735,7 @@ static inline void thread_detach(thread_t t){ pthread_detach(t); }
 
 #else
 
-	_Thread_local _Atomic uint32_t _a_park_flag = 0;
+	_atomic_weaklink _Thread_local _Atomic uint32_t _a_park_flag = 0;
 	static inline wait_t thread_wait_token(void){
 		return (uintptr_t)&_a_park_flag;
 	}
@@ -802,6 +794,14 @@ static inline uint64_t thread_now(void){
 
 #endif // WIN32 / POSIX-like conditional
 
+typedef _Atomic(uint8_t) atomic_uint8_t;
+typedef _Atomic(int8_t) atomic_int8_t;
+typedef _Atomic(uint16_t) atomic_uint16_t;
+typedef _Atomic(int16_t) atomic_int16_t;
+typedef _Atomic(uint32_t) atomic_uint32_t;
+typedef _Atomic(int32_t) atomic_int32_t;
+typedef _Atomic(uint64_t) atomic_uint64_t;
+typedef _Atomic(int64_t) atomic_int64_t;
 typedef _Atomic(ssize_t) atomic_ssize_t;
 
 #define _atomic_wait_until(key, cond, s, y) do{ \

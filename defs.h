@@ -30,6 +30,7 @@ struct _vqueue_msg_hdr{
 
 struct _vqueue_shmem_region{
 	sem_t sema4;
+	_Atomic uint32_t waiting;
 	_Atomic uint32_t open_counter, trim_lock;
 	_Atomic uint64_t failed_trim, lsize;
 	_Atomic uint64_t head, tail, left;
@@ -81,7 +82,7 @@ static inline uint8_t _vqueue_protect(struct _vqueue_mapping* ctx, uint64_t ptr)
 		}
 		if(i >= 63){
 			struct flock l = { .l_type = F_WRLCK, .l_whence = SEEK_SET, .l_start = (~current)>>40, .l_len = 1 };
-			if(!fcntl(ctx->q->shmem_fd, F_GETLK, &l) && l.l_type == F_UNLCK){
+			if(!fcntl(ctx->q->shmem_fd, _VQUEUE_F_GETLK, &l) && l.l_type == F_UNLCK){
 				// previous slot owner died, it's okay to replace the current value
 				i &= 7;
 				goto retry;
@@ -135,14 +136,14 @@ static inline uint8_t _vqueue_compress_size(size_t sz){
 	if(sz <= 81920) return (sz+16383)>>14;
 	unsigned long magn = 0;
 	// 64-clz64(x)
+	sz--;
 #ifdef _MSC_VER
 	if(_BitScanReverse64(&magn, sz)) magn++;
 #else
 	magn = sizeof(long long)*CHAR_BIT-__builtin_clzll(sz);
 #endif
 	magn -= 2;
-	sz += (1ull<<magn)-1;
-	return (magn-13)<<1 | ((sz>>magn)&1);
+	return ((magn-13)<<1 | ((sz>>magn)&1))+1;
 }
 static inline size_t _vqueue_round_size(size_t sz){
 	size_t mask = 16383;

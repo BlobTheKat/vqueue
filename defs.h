@@ -57,8 +57,7 @@ struct _vqueue_mapping{
 };
 
 struct _vqueue{
-	int shmem_fd;
-	uint32_t aid;
+	int shmem_fd; uint32_t aid;
 	struct _vqueue_mapping_descriptor mapping;
 };
 

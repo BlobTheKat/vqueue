@@ -39,7 +39,7 @@ int main(){
 
 ## Details
 
-Vqueue implements an adaptive (unbounded) ring buffer allocator on top of a shared memory object. The "queue" aspect is implemented as a linked list, allowing allocation order to differ from submit order, and simplifying certain aspects of the implementation.
+Vqueue implements an adaptive (unbounded) ring buffer allocator on top of a shared memory object. The "queue" aspect is implemented as a linked list, allowing allocation order to differ from submit order, and avoiding head-of-line blocking.
 
 The entire container is lock-free in order to avoid priority inversion and other unpredictable scheduling shenanigans. It is also designed to be fault tolerant, that is, if one accessing process dies at an arbitrary point, other processes will ensure the queue remains in a valid state with no leaked allocations.
 

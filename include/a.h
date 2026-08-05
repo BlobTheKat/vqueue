@@ -868,27 +868,27 @@ static inline void lock_acquire_explicit(lock_t* lock, int32_t n, memory_order o
 // Acquire `n` slots from a `lock_t`. If those slots are not available, the function will wait until corresponding `lock_release` has released them. Note that this function may acquire only some of the `n` slots at a time, which may cause deadlocks when acquiring more than one slot. This function implies acquire memory ordering (see `lock_acquire_explicit`)
 static inline void lock_acquire(lock_t* lock, int32_t n){ lock_acquire_explicit(lock, n, memory_order_acquire); }
 
-// Overload for `lock_acquire_atomic` with a memory order that must be one of `memory_order_relaxed`, `memory_order_acquire` or `memory_order_seq_cst`
-static inline void lock_acquire_atomic_explicit(lock_t* lock, int32_t n, memory_order order){
+// Overload for `lock_acquire_wait` with a memory order that must be one of `memory_order_relaxed`, `memory_order_acquire` or `memory_order_seq_cst`
+static inline void lock_acquire_wait_explicit(lock_t* lock, int32_t wait_n, int32_t n, memory_order order){
 	uint32_t v = atomic_load_explicit(lock, memory_order_relaxed);
 	loop: {}
-	if((v&0x7FFFFFFF) < (uint32_t)n){
+	if((v&0x7FFFFFFF) < (uint32_t)wait_n){
 		// block
 		int count = A_H_DEFAULT_SPIN;
-		while(count--) if(((v=atomic_load_explicit(lock, memory_order_relaxed))&0x7FFFFFFF) >= (uint32_t)n) goto try_acq; else thread_relax();
+		while(count--) if(((v=atomic_load_explicit(lock, memory_order_relaxed))&0x7FFFFFFF) >= (uint32_t)wait_n) goto try_acq; else thread_relax();
 		count = A_H_DEFAULT_YIELD;
-		while(count--) if(((v=atomic_load_explicit(lock, memory_order_relaxed))&0x7FFFFFFF) >= (uint32_t)n) goto try_acq; else thread_yield();
+		while(count--) if(((v=atomic_load_explicit(lock, memory_order_relaxed))&0x7FFFFFFF) >= (uint32_t)wait_n) goto try_acq; else thread_yield();
 		if(!(v&0x80000000)) atomic_fetch_or_explicit(lock, 0x80000000, memory_order_relaxed), v |= 0x80000000;
 		_atomic_wait32(lock, v);
 		uint32_t v = atomic_load_explicit(lock, memory_order_relaxed);
-		if(v >= (uint32_t)n) goto try_acq;
+		if(v >= (uint32_t)wait_n) goto try_acq;
 		_atomic_wake32(lock, 1);
 	}else try_acq: if(atomic_compare_exchange_weak_explicit(lock, &v, v-(uint32_t)n /* keeps wait flag */, order, memory_order_relaxed))
 		return; // acquired
 	goto loop;
 }
-// Acquire `n` slots from a `lock_t`. If those slots are not available, the function will wait until corresponding `lock_release` has released them. Note unlike `lock_acquire`, this function will not acquire any slots until all of them are available. This function implies acquire memory ordering (see `lock_acquire_atomic_explicit`)
-static inline void lock_acquire_atomic(lock_t* lock, int32_t n){ lock_acquire_atomic_explicit(lock, n, memory_order_acquire); }
+// Wait until at least `wait_n` slots are available on a `lock_t`, and then acquire only `n`. If those slots are not available, the function will wait until corresponding `lock_release` has released them. Note that unlike `lock_acquire`, this function will not acquire any slots until at least `wait_n` are available, and when the slots are acquired, it is done atomically (i.e two concurrent acquire-waits cannot deadlock). This function implies acquire memory ordering (see `lock_acquire_atomic_explicit`). If `n > wait_n`, the behavior is undefined.
+static inline void lock_acquire_wait(lock_t* lock, int32_t wait_n, int32_t n){ lock_acquire_wait_explicit(lock, wait_n, n, memory_order_acquire); }
 
 // Overload for `lock_wait` with a memory order that must be one of `memory_order_relaxed`, `memory_order_acquire` or `memory_order_seq_cst`
 static inline void lock_wait_explicit(lock_t* lock, int32_t n, memory_order order){
@@ -939,7 +939,7 @@ static inline uint32_t lock_fetch_explicit(lock_t* lock, memory_order order){ re
 // See how many slots are available on a `lock_t`. This function implies no memory ordering (see `lock_fetch_explicit`)
 static inline uint32_t lock_fetch(lock_t* lock){ return atomic_load_explicit(lock, memory_order_relaxed)&0x7FFFFFFF; }
 
-// Maximum number of slots a `lock_t` can hold available. Initializing the value to something higher than this limit, or releasing such that the value surpasses this limit, is undefined behavior
+// Maximum number of slots a `lock_t` can hold available. Initializing the value to something higher than this limit, or releasing such that the value surpasses this limit, is undefined behavior. This value is guaranteed a power of two minus one that is no smaller than twice the available hardware concurrency.
 #define LOCK_MAX 2147483647
 
 #if defined(__APPLE__) && !defined(APPLE_NO_UNSTABLE_ULOCK)

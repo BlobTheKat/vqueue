@@ -27,7 +27,7 @@ static inline void* _vqueue_mmap(HANDLE shm_mp, uint64_t off, size_t sz){
 #endif
 
 static inline struct _vqueue_mapping _vqueue_acquire_mapping(struct _vqueue* q){
-	lock_acquire(&q->mapping.lock, 1);
+	lock_acquire_wait(&q->mapping.lock, (LOCK_MAX>>1)+1, 1);
 	atomic_fetch_add_explicit(&q->mapping.ref, 1, memory_order_relaxed);
 	struct _vqueue_shmem_region* region = (struct _vqueue_shmem_region*)(q->mapping.ptr<<6);
 	lock_release(&q->mapping.lock, 1);
@@ -35,7 +35,7 @@ static inline struct _vqueue_mapping _vqueue_acquire_mapping(struct _vqueue* q){
 }
 
 static inline struct _vqueue_mapping _vqueue_get_mapping_for(struct _vqueue* q, char* thing){
-	lock_acquire(&q->mapping.lock, 1);
+	lock_acquire_wait(&q->mapping.lock, (LOCK_MAX>>1)+1, 1);
 	struct _vqueue_mapping_descriptor* v = &q->mapping;
 	next: {}
 	char* region = (char*)(v->ptr<<6);
@@ -53,7 +53,7 @@ static inline struct _vqueue_mapping _vqueue_get_mapping_for(struct _vqueue* q, 
 }
 
 static inline void _vqueue_release_mapping(struct _vqueue_mapping ctx){
-	lock_acquire(&ctx.q->mapping.lock, 1);
+	lock_acquire_wait(&ctx.q->mapping.lock, (LOCK_MAX>>1)+1, 1);
 	uint64_t ptr1 = (uint64_t)ctx.data8 >> 6;
 	if(ctx.q->mapping.ptr == ptr1){
 		atomic_fetch_sub_explicit(&ctx.q->mapping.ref, 1, memory_order_relaxed);
@@ -68,7 +68,8 @@ static inline void _vqueue_release_mapping(struct _vqueue_mapping ctx){
 		lock_release(&ctx.q->mapping.lock, 1);
 		if(finished){
 			munmap(ctx.data8, _vqueue_uncompress_size(ctx.size));
-			lock_acquire(&ctx.q->mapping.lock, LOCK_MAX);
+			lock_acquire_wait(&ctx.q->mapping.lock, (LOCK_MAX>>1)+1, (LOCK_MAX>>1)+1);
+			lock_acquire(&ctx.q->mapping.lock, LOCK_MAX>>1);
 			struct _vqueue_mapping_descriptor** ov2 = &ctx.q->mapping.next, *v2 = *ov2;
 			while(v2){
 				if(v == v2){ *ov2 = v->next; break; }
@@ -87,7 +88,8 @@ static void _vqueue_resize_mapping(struct _vqueue_mapping* ctx, uint8_t size_pac
 	struct _vqueue* q = ctx->q;
 	uint64_t old1 = (uint64_t)ctx->data >> 6;
 	uint64_t newsize = _vqueue_uncompress_size(size_packed);
-	lock_acquire(&q->mapping.lock, LOCK_MAX);
+	lock_acquire_wait(&q->mapping.lock, (LOCK_MAX>>1)+1, (LOCK_MAX>>1)+1);
+	lock_acquire(&q->mapping.lock, LOCK_MAX>>1);
 	if(q->mapping.size_packed >= size_packed){
 		ctx->size = q->mapping.size_packed;
 		ctx->data8 = (_Atomic uint64_t*)(q->mapping.ptr<<6);

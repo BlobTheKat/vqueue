@@ -1,5 +1,5 @@
 #define _FILE_OFFSET_BITS 64
-#include <vqueue.h>
+#include "vqueue.h"
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -27,7 +27,7 @@ static inline void* _vqueue_mmap(HANDLE shm_mp, uint64_t off, size_t sz){
 #endif
 
 static inline struct _vqueue_mapping _vqueue_acquire_mapping(struct _vqueue* q){
-	lock_acquire_wait(&q->mapping.lock, (LOCK_MAX>>1)+1, 1);
+	lock_wait_acquire(&q->mapping.lock, (LOCK_MAX>>1)+1, 1);
 	atomic_fetch_add_explicit(&q->mapping.ref, 1, memory_order_relaxed);
 	struct _vqueue_shmem_region* region = (struct _vqueue_shmem_region*)(q->mapping.ptr<<6);
 	lock_release(&q->mapping.lock, 1);
@@ -35,7 +35,7 @@ static inline struct _vqueue_mapping _vqueue_acquire_mapping(struct _vqueue* q){
 }
 
 static inline struct _vqueue_mapping _vqueue_get_mapping_for(struct _vqueue* q, char* thing){
-	lock_acquire_wait(&q->mapping.lock, (LOCK_MAX>>1)+1, 1);
+	lock_wait_acquire(&q->mapping.lock, (LOCK_MAX>>1)+1, 1);
 	struct _vqueue_mapping_descriptor* v = &q->mapping;
 	next: {}
 	char* region = (char*)(v->ptr<<6);
@@ -53,7 +53,7 @@ static inline struct _vqueue_mapping _vqueue_get_mapping_for(struct _vqueue* q, 
 }
 
 static inline void _vqueue_release_mapping(struct _vqueue_mapping ctx){
-	lock_acquire_wait(&ctx.q->mapping.lock, (LOCK_MAX>>1)+1, 1);
+	lock_wait_acquire(&ctx.q->mapping.lock, (LOCK_MAX>>1)+1, 1);
 	uint64_t ptr1 = (uint64_t)ctx.data8 >> 6;
 	if(ctx.q->mapping.ptr == ptr1){
 		atomic_fetch_sub_explicit(&ctx.q->mapping.ref, 1, memory_order_relaxed);
@@ -68,7 +68,7 @@ static inline void _vqueue_release_mapping(struct _vqueue_mapping ctx){
 		lock_release(&ctx.q->mapping.lock, 1);
 		if(finished){
 			munmap(ctx.data8, _vqueue_uncompress_size(ctx.size));
-			lock_acquire_wait(&ctx.q->mapping.lock, (LOCK_MAX>>1)+1, (LOCK_MAX>>1)+1);
+			lock_wait_acquire(&ctx.q->mapping.lock, (LOCK_MAX>>1)+1, (LOCK_MAX>>1)+1);
 			lock_acquire(&ctx.q->mapping.lock, LOCK_MAX>>1);
 			struct _vqueue_mapping_descriptor** ov2 = &ctx.q->mapping.next, *v2 = *ov2;
 			while(v2){
@@ -88,7 +88,7 @@ static void _vqueue_resize_mapping(struct _vqueue_mapping* ctx, uint8_t size_pac
 	struct _vqueue* q = ctx->q;
 	uint64_t old1 = (uint64_t)ctx->data >> 6;
 	uint64_t newsize = _vqueue_uncompress_size(size_packed);
-	lock_acquire_wait(&q->mapping.lock, (LOCK_MAX>>1)+1, (LOCK_MAX>>1)+1);
+	lock_wait_acquire(&q->mapping.lock, (LOCK_MAX>>1)+1, (LOCK_MAX>>1)+1);
 	lock_acquire(&q->mapping.lock, LOCK_MAX>>1);
 	if(q->mapping.size_packed >= size_packed){
 		ctx->size = q->mapping.size_packed;
@@ -164,7 +164,9 @@ bool vqueue_open(vqueue_t* q, const char* name, size_t name_sz){
 			atomic_init(&mapping->head, _VQUEUE_PTR_INVALID);
 			atomic_init(&mapping->tail, _VQUEUE_PTR_INVALID);
 			atomic_init(&mapping->trim_lock, 0xFFFFFFFF);
+#ifndef _VQUEUE_U_SEMA4
 			sem_init(&mapping->sema4, 1, 0);
+#endif
 			atomic_thread_fence(memory_order_release);
 			atomic_init(&mapping->lsize, sz);
 		}
@@ -411,9 +413,19 @@ void vqueue_post(vqueue_t* q, vqueue_block_t block){
 	_vqueue_unprotect(&ctx, ptr, n);
 	// if it fails another thread got it anyway
 	atomic_compare_exchange_strong_explicit(&ctx.data->tail, &ptr2, new_ptr, memory_order_release, memory_order_relaxed);
-	end:
-	if(atomic_fetch_sub_explicit(&ctx.data->waiting, 1, memory_order_relaxed) > 0){
+	end: {}
+	uint32_t w = atomic_load_explicit(&ctx.data->waiting, memory_order_relaxed);
+	wake_retry:
+	if(w){
+		if(!atomic_compare_exchange_weak_explicit(&ctx.data->waiting, &w, w-1, memory_order_relaxed, memory_order_relaxed)) goto wake_retry;
+#ifdef _VQUEUE_U_SEMA4
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+		atomic_fetch_add_explicit(&ctx.data->usema4, 1, memory_order_relaxed);
+		syscall(SYS_ulock_wake, 0x1000003, &ctx.data->usema4, 1, 0);
+#else
 		sem_post(&ctx.data->sema4);
+#endif
 	}
 	_vqueue_release_mapping(ctx);
 }
@@ -427,8 +439,22 @@ vqueue_block_t vqueue_wait(vqueue_t* q){
 	find_next:
 	if(ptr == _VQUEUE_PTR_INVALID){
 		// No messages. Block
-		while(sem_wait(&ctx.data->sema4) == EINTR);
-		goto retry;
+		uint64_t ptr = _vqueue_pointer_acquire(&ctx, _vqueue_offsetof(head), &n);
+		if(ptr == _VQUEUE_PTR_INVALID){
+#ifdef _VQUEUE_U_SEMA4
+			uint32_t v = atomic_load_explicit(&ctx.data->usema4, memory_order_relaxed);
+			retry_usema4:
+			while(!v){
+				if(syscall(SYS_ulock_wait, 0x1000003 /* UL_COMPARE_AND_WAIT_SHARED */, &ctx.data->usema4, 0, 0) && errno == EINVAL) sched_yield();
+				v = atomic_load_explicit(&ctx.data->usema4, memory_order_relaxed);
+			}
+			if(!atomic_compare_exchange_strong_explicit(&ctx.data->usema4, &v, v-1, memory_order_acquire, memory_order_relaxed)) goto retry_usema4;
+#pragma clang diagnostic pop
+#else
+			while(sem_wait(&ctx.data->sema4) && errno == EINTR);
+#endif
+			goto retry;
+		}
 	}
 	size_t emsz = ptr>>40;
 	if(emsz > ctx.size) _vqueue_resize_mapping(&ctx, emsz);
